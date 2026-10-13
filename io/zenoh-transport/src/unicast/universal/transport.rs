@@ -172,7 +172,13 @@ impl TransportUnicastUniversal {
 
         // Notify the callback that we have closed the transport
         if let Some(cb) = callback {
+            tracing::debug!(target: "zenoh::transport::lifecycle", event = "closed_callback_start",
+                peer = %self.config.zid, thread = std::thread::current().name().unwrap_or("unnamed"),
+                "Synchronous closed callback starts");
             cb.closed();
+            tracing::debug!(target: "zenoh::transport::lifecycle", event = "closed_callback_end",
+                peer = %self.config.zid, thread = std::thread::current().name().unwrap_or("unnamed"),
+                "Synchronous closed callback returns");
         }
         // Delete the transport on the manager - this should be the last step to ensure that no new transport to the same peer can be added while we are closing this transport.
         // We also drop the status_guard, to avoid deadlock due to different lock acquisition order in init_existing_transport unicast.
@@ -183,6 +189,14 @@ impl TransportUnicastUniversal {
     }
 
     pub(crate) async fn del_link(&self, link: Link) -> ZResult<()> {
+        let diagnostics =
+            tracing::enabled!(target: "zenoh::transport::lifecycle", tracing::Level::DEBUG)
+                .then(|| (link.to_string(), std::time::Instant::now()));
+        if let Some((diag_link, _)) = &diagnostics {
+            tracing::debug!(target: "zenoh::transport::lifecycle", event = "del_link_start",
+                link = %diag_link, peer = %self.config.zid,
+                thread = std::thread::current().name().unwrap_or("unnamed"), "Link teardown begins");
+        }
         // Try to remove the link
         let Some((is_last, stl, associated_link)) = zwrite!(self.links).remove_link(&link) else {
             bail!(
@@ -196,6 +210,9 @@ impl TransportUnicastUniversal {
         if let Some(callback) = self.callback.get().cloned() {
             let associated_link = associated_link.clone();
             tokio::task::spawn_blocking(move || {
+                tracing::debug!(target: "zenoh::transport::lifecycle", event = "del_link_callback_start",
+                    link = %link, thread = std::thread::current().name().unwrap_or("unnamed"),
+                    "Blocking-pool del_link callback starts");
                 callback.del_link(link);
                 if let Some(asl) = &associated_link {
                     callback.del_link(Link::new_unicast(
@@ -204,8 +221,16 @@ impl TransportUnicastUniversal {
                         asl.link.config.reliability,
                     ));
                 }
+                tracing::debug!(target: "zenoh::transport::lifecycle", event = "del_link_callback_end",
+                    thread = std::thread::current().name().unwrap_or("unnamed"),
+                    "Blocking-pool del_link callback returns");
             })
             .await?;
+        }
+        if let Some((diag_link, _)) = &diagnostics {
+            tracing::debug!(target: "zenoh::transport::lifecycle", event = "del_link_callback_joined",
+                link = %diag_link, peer = %self.config.zid, thread = std::thread::current().name().unwrap_or("unnamed"),
+                "Async teardown resumed after callback processing");
         }
 
         // Associated link must also be closed. run both close calls, return whichever failed first
@@ -220,7 +245,14 @@ impl TransportUnicastUniversal {
         if is_last {
             self.delete().await?;
         }
-        close_stl_res.and(close_asl_res)
+        let result = close_stl_res.and(close_asl_res);
+        if let Some((diag_link, diag_start)) = &diagnostics {
+            tracing::debug!(target: "zenoh::transport::lifecycle", event = "del_link_end",
+                link = %diag_link, peer = %self.config.zid,
+                elapsed_us = diag_start.elapsed().as_micros() as u64,
+                ok = result.is_ok(), "Link teardown finished (final TCP drop logged separately)");
+        }
+        result
     }
 
     async fn sync(

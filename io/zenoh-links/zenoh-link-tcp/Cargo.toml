@@ -38,3 +38,6 @@ zenoh-core = { workspace = true }
 zenoh-link-commons = { workspace = true }
 zenoh-protocol = { workspace = true }
 zenoh-result = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

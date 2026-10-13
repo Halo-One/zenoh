@@ -953,6 +953,14 @@ impl TransportManager {
         self.state.unicast.incoming.fetch_add(1, SeqCst);
 
         // Spawn a task to accept the link
+        let diagnostics =
+            tracing::enabled!(target: "zenoh::transport::lifecycle", tracing::Level::DEBUG)
+                .then(|| (link.to_string(), std::time::Instant::now()));
+        if let Some((diag_link, _)) = &diagnostics {
+            tracing::debug!(target: "zenoh::transport::lifecycle", event = "accept_start", link = %diag_link,
+                timeout_ms = self.config.unicast.accept_timeout.as_millis() as u64,
+                "Incoming setup begins");
+        }
         let c_manager = self.clone();
         self.task_controller
             .spawn_with_rt(zenoh_runtime::ZRuntime::Acceptor, async move {
@@ -963,12 +971,22 @@ impl TransportManager {
                 .await
                 .is_err()
                 {
+                    if let Some((diag_link, diag_start)) = &diagnostics {
+                        tracing::debug!(target: "zenoh::transport::lifecycle", event = "accept_timeout",
+                            link = %diag_link, elapsed_ms = diag_start.elapsed().as_millis() as u64,
+                            "Setup timed out (future/socket drop may delay this report)");
+                    }
                     tracing::debug!(
                         "Failed to accept link before deadline ({}ms)",
                         c_manager.config.unicast.accept_timeout.as_millis()
                     );
                 }
                 incoming_counter.fetch_sub(1, SeqCst);
+                if let Some((diag_link, diag_start)) = &diagnostics {
+                    tracing::debug!(target: "zenoh::transport::lifecycle", event = "accept_end", link = %diag_link,
+                        elapsed_ms = diag_start.elapsed().as_millis() as u64,
+                        "Incoming setup task finished");
+                }
             });
     }
 }

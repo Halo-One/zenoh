@@ -234,6 +234,9 @@ impl TransportLinkUnicastUniversal {
             if let Err(e) = res {
                 // process error if task was not cancelled
                 tracing::debug!("RX task failed: {}", e);
+                tracing::debug!(target: "zenoh::transport::lifecycle", event = "rx_task_error",
+                    link = %rx.link, peer = %transport.config.zid, lease_ms = lease.as_millis() as u64,
+                    error = %e, "RX task ended with error");
 
                 // Spawn a task to avoid a deadlock waiting for this same task
                 // to finish in the close() joining its handle
@@ -528,6 +531,10 @@ async fn read_loop<F: Fn() -> Box<[u8]>>(
                 transport.read_messages(batch, link, #[cfg(feature = "stats")] &stats)?;
             }
             _ = lease_tracker.wait_if(priority.unwrap_or(Priority::Control) == Priority::Control) => {
+                tracing::debug!(target: "zenoh::transport::lifecycle", event = "rx_lease_expired",
+                    link = %link.link, peer = %transport.config.zid,
+                    lease_ms = lease_tracker.timeout().as_millis() as u64,
+                    "Receive lease expired");
                 bail!("{link}: expired after {} milliseconds", lease_tracker.timeout().as_millis());
             }
         }

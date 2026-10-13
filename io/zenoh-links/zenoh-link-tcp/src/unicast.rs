@@ -11,8 +11,10 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(all(feature = "uring", target_os = "linux"))]
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 use std::{cell::UnsafeCell, convert::TryInto, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -38,7 +40,8 @@ use crate::{
 
 pub struct LinkUnicastTcp {
     // The underlying socket as returned from the tokio library
-    socket: UnsafeCell<TcpStream>,
+    socket: UnsafeCell<Option<TcpStream>>,
+    diag_id: u64,
     // The source socket address of this link (address used on the local host)
     src_addr: SocketAddr,
     src_locator: Locator,
@@ -53,6 +56,8 @@ unsafe impl Sync for LinkUnicastTcp {}
 
 impl LinkUnicastTcp {
     fn new(socket: TcpStream, src_addr: SocketAddr, dst_addr: SocketAddr) -> LinkUnicastTcp {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let diag_id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Set the TCP nodelay option
         if let Err(err) = socket.set_nodelay(true) {
             tracing::warn!(
@@ -64,10 +69,11 @@ impl LinkUnicastTcp {
         }
 
         // Set the TCP linger option
-        #[allow(deprecated)]
-        if let Err(err) = socket.set_linger(Some(Duration::from_secs(
+        let linger = Some(Duration::from_secs(
             (*TCP_LINGER_TIMEOUT).try_into().unwrap(),
-        ))) {
+        ));
+        #[allow(deprecated)]
+        if let Err(err) = socket.set_linger(linger) {
             tracing::warn!(
                 "Unable to set LINGER option on TCP link {} => {}: {}",
                 src_addr,
@@ -75,6 +81,11 @@ impl LinkUnicastTcp {
                 err
             );
         }
+
+        tracing::debug!(target: "zenoh::transport::lifecycle", event = "tcp_link_created",
+            diag_id, src = %src_addr, dst = %dst_addr, requested_linger = ?linger,
+            effective_linger = ?socket2::SockRef::from(&socket).linger(),
+            "TCP link created");
 
         // Compute the MTU
         // See IETF RFC6691: https://datatracker.ietf.org/doc/rfc6691/
@@ -101,7 +112,8 @@ impl LinkUnicastTcp {
 
         // Build the Tcp object
         LinkUnicastTcp {
-            socket: UnsafeCell::new(socket),
+            socket: UnsafeCell::new(Some(socket)),
+            diag_id,
             src_addr,
             src_locator: Locator::new(TCP_LOCATOR_PREFIX, src_addr.to_string(), "").unwrap(),
             dst_addr,
@@ -113,12 +125,17 @@ impl LinkUnicastTcp {
     #[allow(clippy::mut_from_ref)]
     fn get_mut_socket(&self) -> &mut TcpStream {
         unsafe { &mut *self.socket.get() }
+            .as_mut()
+            .expect("TCP socket already dropped")
     }
 }
 
 #[async_trait]
 impl LinkUnicastTrait for LinkUnicastTcp {
     async fn close(&self) -> ZResult<()> {
+        tracing::debug!(target: "zenoh::transport::lifecycle", event = "tcp_shutdown_start",
+            diag_id = self.diag_id, src = %self.src_addr, dst = %self.dst_addr,
+            "TCP shutdown begins (not final socket drop)");
         tracing::trace!("Closing TCP link: {}", self);
         // Close the underlying TCP socket
         self.get_mut_socket().shutdown().await.map_err(|e| {
@@ -202,7 +219,11 @@ impl LinkUnicastTrait for LinkUnicastTcp {
 
     #[cfg(all(feature = "uring", target_os = "linux"))]
     fn get_fd(&self) -> ZResult<RawFd> {
-        match unsafe { &*self.socket.get() }.as_raw_fd() {
+        match unsafe { &*self.socket.get() }
+            .as_ref()
+            .expect("TCP socket already dropped")
+            .as_raw_fd()
+        {
             fd if fd < 0 => bail!("FD unavailable"),
             fd => Ok(fd),
         }
@@ -220,6 +241,52 @@ impl LinkUnicastTrait for LinkUnicastTcp {
 //         });
 //     }
 // }
+
+impl Drop for LinkUnicastTcp {
+    fn drop(&mut self) {
+        let Some(socket) = self.socket.get_mut().take() else {
+            return;
+        };
+        // Avoid queue queries and timing work when the diagnostic target is disabled.
+        if !tracing::enabled!(target: "zenoh::transport::lifecycle", tracing::Level::DEBUG) {
+            drop(socket);
+            return;
+        }
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        #[cfg(target_os = "linux")]
+        let (fd, outq_bytes, notsent_bytes, tid) = {
+            let fd = socket.as_raw_fd();
+            // SIOCOUTQ includes unsent and unacknowledged bytes; SIOCOUTQNSD
+            // includes unsent only. Query before close removes the descriptor.
+            let query = |request| -> Option<i32> {
+                let mut value = 0i32;
+                (unsafe { libc::ioctl(fd, request, &mut value) } == 0).then_some(value)
+            };
+            (
+                fd,
+                query(libc::TIOCOUTQ as _),
+                query(libc::SIOCOUTQNSD as _),
+                unsafe { libc::syscall(libc::SYS_gettid) },
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (fd, outq_bytes, notsent_bytes, tid) = (-1, None::<i32>, None::<i32>, 0);
+        let linger = socket2::SockRef::from(&socket).linger();
+        tracing::debug!(target: "zenoh::transport::lifecycle", event = "tcp_drop_start",
+            diag_id = self.diag_id, src = %self.src_addr, dst = %self.dst_addr,
+            fd, tid, thread = thread_name, ?outq_bytes, ?notsent_bytes, ?linger,
+            "Final TCP socket drop begins");
+        let before = std::time::Instant::now();
+        // Implicit field destruction happens AFTER Drop::drop returns. Destroy
+        // the stream explicitly so the end event measures actual socket close.
+        drop(socket);
+        tracing::debug!(target: "zenoh::transport::lifecycle", event = "tcp_drop_end",
+            diag_id = self.diag_id, src = %self.src_addr, dst = %self.dst_addr,
+            fd, tid, thread = thread_name, close_us = before.elapsed().as_micros() as u64,
+            "Final TCP socket drop finished");
+    }
+}
 
 impl fmt::Display for LinkUnicastTcp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
