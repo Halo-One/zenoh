@@ -100,10 +100,13 @@ impl LinkUnicastTls {
         }
 
         // Set the TLS linger option
+        // Ordinary non-lingering close avoids synchronously waiting for queued
+        // output during final socket destruction. This is not abortive zero linger.
+        let linger = zenoh_link_commons::tcp::socket_linger(|| {
+            Duration::from_secs((*TLS_LINGER_TIMEOUT).try_into().unwrap())
+        });
         #[allow(deprecated)]
-        if let Err(err) = tcp_stream.set_linger(Some(Duration::from_secs(
-            (*TLS_LINGER_TIMEOUT).try_into().unwrap(),
-        ))) {
+        if let Err(err) = tcp_stream.set_linger(linger) {
             tracing::warn!(
                 "Unable to set LINGER option on TLS link {} => {}: {}",
                 src_addr,

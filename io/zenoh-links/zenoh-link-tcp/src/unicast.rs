@@ -69,9 +69,11 @@ impl LinkUnicastTcp {
         }
 
         // Set the TCP linger option
-        let linger = Some(Duration::from_secs(
-            (*TCP_LINGER_TIMEOUT).try_into().unwrap(),
-        ));
+        // Ordinary non-lingering close avoids synchronously waiting for queued
+        // output during final socket destruction. This is not abortive zero linger.
+        let linger = zenoh_link_commons::tcp::socket_linger(|| {
+            Duration::from_secs((*TCP_LINGER_TIMEOUT).try_into().unwrap())
+        });
         #[allow(deprecated)]
         if let Err(err) = socket.set_linger(linger) {
             tracing::warn!(

@@ -11,12 +11,26 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::OnceLock, time::Duration};
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use zenoh_result::{zerror, ZResult};
 
 use crate::set_dscp;
+
+/// Apply the process-wide runtime linger override to a transport's default.
+/// `ZENOH_SOCKET_LINGER=off` disables positive linger for TCP and TLS links.
+/// The environment is read once, when the first TCP or TLS link is constructed.
+pub fn socket_linger(default: impl FnOnce() -> Duration) -> Option<Duration> {
+    static LINGER_OFF: OnceLock<bool> = OnceLock::new();
+    if *LINGER_OFF
+        .get_or_init(|| std::env::var_os("ZENOH_SOCKET_LINGER").is_some_and(|value| value == "off"))
+    {
+        None
+    } else {
+        Some(default())
+    }
+}
 
 #[derive(Debug)]
 pub struct TcpSocketConfig<'a> {
